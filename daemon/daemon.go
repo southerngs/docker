@@ -11,9 +11,9 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -45,12 +45,12 @@ import (
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/graphdb"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/namesgenerator"
 	"github.com/docker/docker/pkg/progress"
+	"github.com/docker/docker/pkg/registrar"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
@@ -145,8 +145,6 @@ type Daemon struct {
 	trustKey                  libtrust.PrivateKey
 	idIndex                   *truncindex.TruncIndex
 	configStore               *Config
-	containerGraphDB          *graphdb.Database
-	driver                    graphdriver.Driver
 	execDriver                execdriver.Driver
 	statsCollector            *statsCollector
 	defaultLogConfig          containertypes.LogConfig
@@ -161,6 +159,8 @@ type Daemon struct {
 	gidMaps                   []idtools.IDMap
 	layerStore                layer.Store
 	imageStore                image.Store
+	nameIndex                 *registrar.Registrar
+	linkIndex                 *linkIndex
 }
 
 // GetContainer looks for a container using the provided information, which could be
@@ -244,8 +244,7 @@ func (daemon *Daemon) registerName(container *container.Container) error {
 			logrus.Errorf("Error saving container name to disk: %v", err)
 		}
 	}
-
-	return nil
+	return daemon.nameIndex.Reserve(container.Name, container.ID)
 }
 
 // Register makes a container object usable by the daemon as <container.ID>
@@ -256,10 +255,8 @@ func (daemon *Daemon) Register(container *container.Container) error {
 	} else {
 		container.NewNopInputPipe()
 	}
-	daemon.containers.Add(container.ID, container)
 
-	// don't update the Suffixarray if we're starting up
-	// we'll waste time if we update it for every container
+	daemon.containers.Add(container.ID, container)
 	daemon.idIndex.Add(container.ID)
 
 	if container.IsRunning() {
@@ -290,15 +287,10 @@ func (daemon *Daemon) Register(container *container.Container) error {
 }
 
 func (daemon *Daemon) restore() error {
-	type cr struct {
-		container  *container.Container
-		registered bool
-	}
-
 	var (
 		debug         = os.Getenv("DEBUG") != ""
-		currentDriver = daemon.driver.String()
-		containers    = make(map[string]*cr)
+		currentDriver = daemon.GraphDriverName()
+		containers    = make(map[string]*container.Container)
 	)
 
 	if !debug {
@@ -331,8 +323,7 @@ func (daemon *Daemon) restore() error {
 		if (container.Driver == "" && currentDriver == "aufs") || container.Driver == currentDriver {
 			logrus.Debugf("Loaded container %v", container.ID)
 
-			containers[container.ID] = &cr{container: container}
-
+			containers[container.ID] = container
 			// FIXME: If the container was checkpointed, we need to reserve the original IP address.
 			// This code is no longer compatible with libnetwork
 			//
@@ -349,55 +340,57 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
-	if entities := daemon.containerGraphDB.List("/", -1); entities != nil {
-		for _, p := range entities.Paths() {
-			if !debug && logrus.GetLevel() == logrus.InfoLevel {
-				fmt.Print(".")
-			}
+	restartContainers := make(map[*container.Container]chan struct{})
+	for _, c := range containers {
+		if err := daemon.registerName(c); err != nil {
+			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+			continue
+		}
+		if err := daemon.Register(c); err != nil {
+			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+			continue
+		}
 
-			e := entities[p]
+		// get list of containers we need to restart
+		if daemon.configStore.AutoRestart && c.ShouldRestart() {
+			restartContainers[c] = make(chan struct{})
+		}
+	}
 
-			if c, ok := containers[e.ID()]; ok {
-				c.registered = true
-			}
+	// Now that all the containers are registered, register the links
+	for _, c := range containers {
+		if err := daemon.registerLinks(c, c.HostConfig); err != nil {
+			logrus.Errorf("failed to register link for container %s: %v", c.ID, err)
 		}
 	}
 
 	group := sync.WaitGroup{}
-	for _, c := range containers {
+	for c, notifier := range restartContainers {
 		group.Add(1)
 
-		go func(container *container.Container, registered bool) {
+		go func(c *container.Container, chNotify chan struct{}) {
 			defer group.Done()
 
-			if !registered {
-				// Try to set the default name for a container if it exists prior to links
-				container.Name, err = daemon.generateNewName(container.ID)
-				if err != nil {
-					logrus.Debugf("Setting default id - %s", err)
+			logrus.Debugf("Starting container %s", c.ID)
+
+			// ignore errors here as this is a best effort to wait for children to be
+			//   running before we try to start the container
+			children := daemon.children(c)
+			timeout := time.After(5 * time.Second)
+			for _, child := range children {
+				if notifier, exists := restartContainers[child]; exists {
+					select {
+					case <-notifier:
+					case <-timeout:
+					}
 				}
 			}
-			if err := daemon.registerName(container); err != nil {
-				logrus.Errorf("Failed to register container %s: %s", container.ID, err)
-				return
+			if err := daemon.containerStart(c); err != nil {
+				logrus.Errorf("Failed to start container %s: %s", c.ID, err)
 			}
+			close(chNotify)
+		}(c, notifier)
 
-			if err := daemon.Register(container); err != nil {
-				logrus.Errorf("Failed to register container %s: %s", container.ID, err)
-				// The container register failed should not be started.
-				return
-			}
-
-			// check the restart policy on the containers and restart any container with
-			// the restart policy of "always"
-			if daemon.configStore.AutoRestart && container.ShouldRestart() {
-				logrus.Debugf("Starting container %s", container.ID)
-
-				if err := daemon.containerStart(container); err != nil {
-					logrus.Errorf("Failed to start container %s: %s", container.ID, err)
-				}
-			}
-		}(c.container, c.registered)
 	}
 	group.Wait()
 
@@ -447,26 +440,26 @@ func (daemon *Daemon) reserveName(id, name string) (string, error) {
 	if !validContainerNamePattern.MatchString(name) {
 		return "", fmt.Errorf("Invalid container name (%s), only %s are allowed", name, validContainerNameChars)
 	}
-
 	if name[0] != '/' {
 		name = "/" + name
 	}
 
-	if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
-		if !graphdb.IsNonUniqueNameError(err) {
-			return "", err
+	if err := daemon.nameIndex.Reserve(name, id); err != nil {
+		if err == registrar.ErrNameReserved {
+			id, err := daemon.nameIndex.Get(name)
+			if err != nil {
+				logrus.Errorf("got unexpected error while looking up reserved name: %v", err)
+				return "", err
+			}
+			return "", fmt.Errorf("Conflict. The name %q is already in use by container %s. You have to remove (or rename) that container to be able to reuse that name.", name, id)
 		}
-
-		conflictingContainer, err := daemon.GetByName(name)
-		if err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf(
-			"Conflict. The name %q is already in use by container %s. You have to remove (or rename) that container to be able to reuse that name.", strings.TrimPrefix(name, "/"),
-			stringid.TruncateID(conflictingContainer.ID))
-
+		return "", fmt.Errorf("error reserving name: %s, error: %v", name, err)
 	}
 	return name, nil
+}
+
+func (daemon *Daemon) releaseName(name string) {
+	daemon.nameIndex.Release(name)
 }
 
 func (daemon *Daemon) generateNewName(id string) (string, error) {
@@ -477,17 +470,17 @@ func (daemon *Daemon) generateNewName(id string) (string, error) {
 			name = "/" + name
 		}
 
-		if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
-			if !graphdb.IsNonUniqueNameError(err) {
-				return "", err
+		if err := daemon.nameIndex.Reserve(name, id); err != nil {
+			if err == registrar.ErrNameReserved {
+				continue
 			}
-			continue
+			return "", err
 		}
 		return name, nil
 	}
 
 	name = "/" + stringid.TruncateID(id)
-	if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
+	if err := daemon.nameIndex.Reserve(name, id); err != nil {
 		return "", err
 	}
 	return name, nil
@@ -537,32 +530,19 @@ func (daemon *Daemon) newContainer(name string, config *containertypes.Config, i
 	return base, err
 }
 
-// GetFullContainerName returns a constructed container name. I think
-// it has to do with the fact that a container is a file on disk and
-// this is sort of just creating a file name.
-func GetFullContainerName(name string) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("Container name cannot be empty")
-	}
-	if name[0] != '/' {
-		name = "/" + name
-	}
-	return name, nil
-}
-
 // GetByName returns a container given a name.
 func (daemon *Daemon) GetByName(name string) (*container.Container, error) {
-	fullName, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
+	fullName := name
+	if name[0] != '/' {
+		fullName = "/" + name
 	}
-	entity := daemon.containerGraphDB.Get(fullName)
-	if entity == nil {
+	id, err := daemon.nameIndex.Get(fullName)
+	if err != nil {
 		return nil, fmt.Errorf("Could not find entity for %s", name)
 	}
-	e := daemon.containers.Get(entity.ID())
+	e := daemon.containers.Get(id)
 	if e == nil {
-		return nil, fmt.Errorf("Could not find container for entity id %s", entity.ID())
+		return nil, fmt.Errorf("Could not find container for entity id %s", id)
 	}
 	return e, nil
 }
@@ -608,48 +588,22 @@ func (daemon *Daemon) GetLabels(id string) map[string]string {
 	return nil
 }
 
-// children returns all child containers of the container with the
-// given name. The containers are returned as a map from the container
-// name to a pointer to Container.
-func (daemon *Daemon) children(name string) (map[string]*container.Container, error) {
-	name, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
-	}
-	children := make(map[string]*container.Container)
-
-	err = daemon.containerGraphDB.Walk(name, func(p string, e *graphdb.Entity) error {
-		c, err := daemon.GetContainer(e.ID())
-		if err != nil {
-			return err
-		}
-		children[p] = c
-		return nil
-	}, 0)
-
-	if err != nil {
-		return nil, err
-	}
-	return children, nil
+func (daemon *Daemon) children(c *container.Container) map[string]*container.Container {
+	return daemon.linkIndex.children(c)
 }
 
 // parents returns the names of the parent containers of the container
 // with the given name.
-func (daemon *Daemon) parents(name string) ([]string, error) {
-	name, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
-	}
-
-	return daemon.containerGraphDB.Parents(name)
+func (daemon *Daemon) parents(c *container.Container) map[string]*container.Container {
+	return daemon.linkIndex.parents(c)
 }
 
 func (daemon *Daemon) registerLink(parent, child *container.Container, alias string) error {
-	fullName := filepath.Join(parent.Name, alias)
-	if !daemon.containerGraphDB.Exists(fullName) {
-		_, err := daemon.containerGraphDB.Set(fullName, child.ID)
+	fullName := path.Join(parent.Name, alias)
+	if err := daemon.nameIndex.Reserve(fullName, child.ID); err != nil {
 		return err
 	}
+	daemon.linkIndex.link(parent, child, fullName)
 	return nil
 }
 
@@ -839,14 +793,6 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 		return nil, fmt.Errorf("Error initializing network controller: %v", err)
 	}
 
-	graphdbPath := filepath.Join(config.Root, "linkgraph.db")
-	graph, err := graphdb.NewSqliteConn(graphdbPath)
-	if err != nil {
-		return nil, err
-	}
-
-	d.containerGraphDB = graph
-
 	sysInfo := sysinfo.New(false)
 	// Check if Devices cgroup is mounted, it is hard requirement for container security,
 	// on Linux/FreeBSD.
@@ -878,10 +824,12 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 	d.uidMaps = uidMaps
 	d.gidMaps = gidMaps
 
+	d.nameIndex = registrar.NewRegistrar()
+	d.linkIndex = newLinkIndex()
+
 	if err := d.cleanupMounts(); err != nil {
 		return nil, err
 	}
-
 	go d.execCommandGC()
 
 	if err := d.restore(); err != nil {
@@ -959,15 +907,9 @@ func (daemon *Daemon) Shutdown() error {
 		daemon.netController.Stop()
 	}
 
-	if daemon.containerGraphDB != nil {
-		if err := daemon.containerGraphDB.Close(); err != nil {
-			logrus.Errorf("Error during container graph.Close(): %v", err)
-		}
-	}
-
-	if daemon.driver != nil {
-		if err := daemon.driver.Cleanup(); err != nil {
-			logrus.Errorf("Error during graph storage driver.Cleanup(): %v", err)
+	if daemon.layerStore != nil {
+		if err := daemon.layerStore.Cleanup(); err != nil {
+			logrus.Errorf("Error during layer Store.Cleanup(): %v", err)
 		}
 	}
 
@@ -1363,10 +1305,6 @@ func (daemon *Daemon) ExecutionDriver() execdriver.Driver {
 	return daemon.execDriver
 }
 
-func (daemon *Daemon) containerGraph() *graphdb.Database {
-	return daemon.containerGraphDB
-}
-
 // GetUIDGIDMaps returns the current daemon's user namespace settings
 // for the full uid and gid maps which will be applied to containers
 // started in this instance.
@@ -1444,8 +1382,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 	}
 
 	container.HostConfig = hostConfig
-	container.ToDisk()
-	return nil
+	return container.ToDisk()
 }
 
 func (daemon *Daemon) setupInitLayer(initPath string) error {
