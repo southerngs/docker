@@ -11,8 +11,6 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/image"
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/filters"
 	"github.com/docker/go-connections/nat"
 )
 

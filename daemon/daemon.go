@@ -145,6 +145,7 @@ type Daemon struct {
 	trustKey                  libtrust.PrivateKey
 	idIndex                   *truncindex.TruncIndex
 	configStore               *Config
+	driver                    graphdriver.Driver
 	execDriver                execdriver.Driver
 	statsCollector            *statsCollector
 	defaultLogConfig          containertypes.LogConfig
@@ -289,8 +290,9 @@ func (daemon *Daemon) Register(container *container.Container) error {
 func (daemon *Daemon) restore() error {
 	var (
 		debug         = os.Getenv("DEBUG") != ""
-		currentDriver = daemon.GraphDriverName()
-		containers    = make(map[string]*container.Container)
+		currentDriver = daemon.driver.String()
+		//currentDriver = daemon.GraphDriverName()
+		containers = make(map[string]*container.Container)
 	)
 
 	if !debug {
@@ -907,9 +909,9 @@ func (daemon *Daemon) Shutdown() error {
 		daemon.netController.Stop()
 	}
 
-	if daemon.layerStore != nil {
-		if err := daemon.layerStore.Cleanup(); err != nil {
-			logrus.Errorf("Error during layer Store.Cleanup(): %v", err)
+	if daemon.driver != nil {
+		if err := daemon.driver.Cleanup(); err != nil {
+			logrus.Errorf("Error during graph storage driver.Cleanup(): %v", err)
 		}
 	}
 
